@@ -19,7 +19,7 @@ from apscheduler.triggers.cron import CronTrigger
 import aiohttp
 import asyncpg
 import google.generativeai as genai
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Response, BackgroundTasks
 from lxml import html as lxml_html
@@ -30,14 +30,13 @@ from telegram.constants import ParseMode
 
 load_dotenv()
 
-# ---------- Environment variables ----------
+# ---------- Environment ----------
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 ADMIN_ID = int(os.getenv("ADMIN_USER_ID", 0))
 DATABASE_URL = os.getenv("SUPABASE_DATABASE_URL")
 PORT = int(os.environ.get("PORT", 8080))
 
-# Configuration
 MAX_CONCURRENT_BROADCASTS = 30
 BROADCAST_CHUNK_SIZE = 100
 DB_POOL_SIZE = 10
@@ -52,7 +51,7 @@ DEAD_LETTER_RETRY_DELAYS = [1, 5, 15, 30, 60]
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------- Validation ----------
+# ---------- Validate env ----------
 missing = []
 if not TOKEN: missing.append("TELEGRAM_BOT_TOKEN")
 if not GEMINI_API_KEY: missing.append("GEMINI_API_KEY")
@@ -65,7 +64,7 @@ if "sslmode" not in DATABASE_URL.lower():
     separator = "&" if "?" in DATABASE_URL else "?"
     DATABASE_URL += f"{separator}sslmode=require"
 
-# ---------- AI Provider abstraction ----------
+# ---------- AI Provider ----------
 class AIProvider:
     def __init__(self):
         genai.configure(api_key=GEMINI_API_KEY)
@@ -103,23 +102,7 @@ class DealAnalysis(BaseModel):
     alternatives: List[str]
     is_expired: bool
 
-# ---------- Shared aiohttp session ----------
-http_session: aiohttp.ClientSession = None
-
-async def get_http_session() -> aiohttp.ClientSession:
-    global http_session
-    if http_session is None:
-        connector = aiohttp.TCPConnector(limit=HTTP_CONNECTOR_LIMIT, ttl_dns_cache=300)
-        http_session = aiohttp.ClientSession(connector=connector)
-    return http_session
-
-async def close_http_session():
-    global http_session
-    if http_session:
-        await http_session.close()
-        http_session = None
-
-# ---------- SSRF protection (DNS rebinding resistant) ----------
+# ---------- SSRF protection with SSL disabled for IP fetch ----------
 async def resolve_and_pin_ip(url: str) -> Optional[str]:
     parsed = urlparse(url)
     host = parsed.hostname
@@ -147,7 +130,9 @@ async def safe_fetch_url(url: str) -> Optional[str]:
     if parsed.query:
         ip_url += f"?{parsed.query}"
     headers = {"Host": parsed.hostname, "User-Agent": "Mozilla/5.0"}
-    session = await get_http_session()
+    # Disable SSL verification to avoid certificate mismatch (IP vs domain)
+    connector = aiohttp.TCPConnector(ssl=False)
+    session = aiohttp.ClientSession(connector=connector)
     try:
         async with session.get(ip_url, headers=headers, timeout=EXTRACTION_TIMEOUT) as resp:
             if resp.status == 200:
@@ -155,10 +140,28 @@ async def safe_fetch_url(url: str) -> Optional[str]:
             else:
                 logger.warning(f"IP fetch failed for {url}: HTTP {resp.status}")
     except Exception as e:
-        logger.error(f"IP fetch error: {e}")
+        logger.error(f"IP fetch error for {url}: {e}")
+    finally:
+        await session.close()
     return None
 
-# ---------- Database connection and tables ----------
+# ---------- Shared aiohttp session for normal use ----------
+http_session: aiohttp.ClientSession = None
+
+async def get_http_session() -> aiohttp.ClientSession:
+    global http_session
+    if http_session is None:
+        connector = aiohttp.TCPConnector(limit=HTTP_CONNECTOR_LIMIT, ttl_dns_cache=300)
+        http_session = aiohttp.ClientSession(connector=connector)
+    return http_session
+
+async def close_http_session():
+    global http_session
+    if http_session:
+        await http_session.close()
+        http_session = None
+
+# ---------- Database pool ----------
 db_pool: asyncpg.Pool = None
 
 async def init_db_pool():
@@ -172,7 +175,6 @@ async def init_db_pool():
 
 async def init_tables():
     async with db_pool.acquire() as conn:
-        # 1. sent_deals (no foreign keys)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS sent_deals (
                 id BIGSERIAL PRIMARY KEY,
@@ -193,7 +195,7 @@ async def init_tables():
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_sent_deals_sent_at ON sent_deals(sent_at);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_sent_deals_expired ON sent_deals(is_expired);")
 
-        # 2. Drop any existing foreign key constraint on sent_deal_messages (safe migration)
+        # Drop any existing foreign key constraint that might cause trouble
         await conn.execute("""
             DO $$
             BEGIN
@@ -208,7 +210,6 @@ async def init_tables():
             $$;
         """)
 
-        # 3. sent_deal_messages (no foreign key constraint)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS sent_deal_messages (
                 id SERIAL PRIMARY KEY,
@@ -221,7 +222,6 @@ async def init_tables():
         """)
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_sent_messages_deal ON sent_deal_messages(deal_id);")
 
-        # 4. Other tables
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS deal_snapshots (
                 id BIGSERIAL PRIMARY KEY,
@@ -296,7 +296,7 @@ async def init_tables():
 
         logger.info("✅ All tables ready")
 
-# ---------- Database helpers (unchanged) ----------
+# ---------- Database helpers ----------
 async def register_user(user_id: int):
     async with db_pool.acquire() as conn:
         await conn.execute("INSERT INTO users (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING", user_id)
@@ -375,7 +375,6 @@ async def update_tracked_product_price(track_id: int, new_price: float):
     async with db_pool.acquire() as conn:
         await conn.execute("UPDATE tracked_products SET last_price=$1, last_check=$2 WHERE id=$3", new_price, datetime.now(timezone.utc), track_id)
 
-# ---------- Source health ----------
 async def record_source_success(source: str):
     async with db_pool.acquire() as conn:
         await conn.execute("""
@@ -405,7 +404,6 @@ async def is_source_downgraded(source: str) -> bool:
         row = await conn.fetchval("SELECT downgraded FROM source_health WHERE source = $1", source)
         return row or False
 
-# ---------- Dead letter queue ----------
 async def add_failed_job(job_type: str, payload: dict, error: str):
     next_retry = datetime.now(timezone.utc) + timedelta(minutes=DEAD_LETTER_RETRY_DELAYS[0])
     async with db_pool.acquire() as conn:
@@ -434,7 +432,6 @@ async def retry_failed_jobs():
             elif job_type == "broadcast":
                 await broadcast_queue.put(payload)
 
-# ---------- Fingerprint deduplication ----------
 def generate_deal_fingerprint(title: str, price: float, source: str) -> str:
     normalized = re.sub(r'[^a-z0-9]', '', title.lower())
     return hashlib.sha256(f"{normalized}|{price:.2f}|{source}".encode()).hexdigest()
@@ -443,7 +440,6 @@ async def is_deal_seen(fingerprint: str) -> bool:
     async with db_pool.acquire() as conn:
         return bool(await conn.fetchval("SELECT 1 FROM sent_deals WHERE fingerprint = $1", fingerprint))
 
-# ---------- Price history ----------
 async def record_price_history(product_key: str, price: float, source: str):
     async with db_pool.acquire() as conn:
         await conn.execute("""
@@ -451,7 +447,6 @@ async def record_price_history(product_key: str, price: float, source: str):
             VALUES ($1,$2,$3,$4)
         """, product_key, price, datetime.now(timezone.utc), source)
 
-# ---------- Fast extraction (no confidence) ----------
 def extract_price_fast(text: str) -> float:
     matches = re.findall(r'[\d,]+(?:\.\d+)?', text.replace(',', ''))
     if matches:
@@ -479,8 +474,7 @@ async def fast_extract_deals_from_html(html_content: str, source: str) -> List[d
                     "title": title, "url": url, "price": price, "original_price": original_price,
                     "bank_offers": "Check site", "rating": "4.0", "source": source
                 })
-        # For other sources, similar logic would be added (GrabOn, Amazon, Flipkart)
-        # For brevity, we keep the structure – in production you'd expand.
+        # For other sources you would add similar logic (GrabOn, Amazon, Flipkart)
     except Exception as e:
         logger.warning(f"Fast extraction failed for {source}: {e}")
     return deals
@@ -602,37 +596,20 @@ Generate a SHORT, engaging analysis in Hinglish. Use emojis naturally. Include g
         await add_failed_job("analyze", {"deal": deal}, str(e))
         return {**deal, "analysis_text": "⚠️ Analysis temporarily unavailable", "verdict": "Average", "flaws": [], "alternatives": [], "is_expired": False}
 
-async def check_tracked_products(app: Application):
-    products = await get_tracked_products()
-    for prod in products:
-        html = await safe_fetch_url(prod['product_url'])
-        if not html:
-            continue
-        tree = lxml_html.fromstring(html)
-        price_elem = tree.xpath('//span[contains(@class,"price")] | //div[contains(@class,"price")] | //meta[@property="product:price:amount"]')
-        price = 0.0
-        if price_elem:
-            price_text = price_elem[0].text_content() if hasattr(price_elem[0], 'text_content') else price_elem[0].get('content', '')
-            price = extract_price_fast(price_text)
-        if price <= 0:
-            continue
-        product_key = generate_deal_fingerprint(prod['product_url'], price, "tracked")
-        await record_price_history(product_key, price, "tracked")
-        if prod['last_price'] == 0:
-            await update_tracked_product_price(prod['id'], price)
-            continue
-        if price < prod['last_price'] or (prod['target_price'] > 0 and price <= prod['target_price']):
-            msg = f"🔔 *Price Alert!*\n\n{prod['product_url']}\nPrevious: ₹{prod['last_price']:,.0f}\nNow: ₹{price:,.0f}"
-            try:
-                await app.bot.send_message(chat_id=prod['user_id'], text=msg, parse_mode=ParseMode.MARKDOWN)
-            except Exception as e:
-                logger.error(f"Alert failed: {e}")
-            await update_tracked_product_price(prod['id'], price)
-        else:
-            await update_tracked_product_price(prod['id'], price)
-        await asyncio.sleep(random.uniform(1, 3))
+async def quick_check_page(url: str) -> dict:
+    html = await safe_fetch_url(url)
+    if not html:
+        return {"price": 0, "in_stock": True, "expired": False}
+    tree = lxml_html.fromstring(html)
+    price_elem = tree.xpath('//span[contains(@class,"price")] | //div[contains(@class,"price")]')
+    price = 0.0
+    if price_elem:
+        price = extract_price_fast(price_elem[0].text_content())
+    oos_text = tree.xpath('//*[contains(text(),"out of stock") or contains(text(),"Out of Stock")]')
+    expired = bool(oos_text)
+    return {"price": price, "in_stock": not expired, "expired": expired}
 
-# ---------- Queues and workers ----------
+# ---------- Workers and queues ----------
 extraction_queue = asyncio.Queue()
 analysis_queue = asyncio.Queue()
 broadcast_queue = asyncio.Queue()
@@ -676,6 +653,55 @@ async def analysis_worker(app: Application):
         except Exception as e:
             logger.error(f"Analysis worker error: {e}")
             await asyncio.sleep(1)
+
+def format_deal_message(deal: dict) -> str:
+    analysis = deal.get('analysis_text') or deal.get('analysis_summary', 'No analysis')
+    title = escape(deal['title'])
+    analysis_escaped = escape(analysis)
+    flaws = [escape(f) for f in deal.get('flaws', [])]
+    verdict = escape(deal.get('verdict', 'Average'))
+    bank = escape(deal.get('bank_offers', 'No bank offers'))
+    source = escape(deal.get('source', 'Unknown'))
+
+    if deal.get('is_expired'):
+        title_display = f"<s>{title}</s>"
+        price_display = f"<s>₹{float(deal['price']):,.0f}</s>"
+        expiry_note = "\n\n❌ Deal expired • Better alternatives below"
+    else:
+        title_display = f"<b>{title}</b>"
+        price_display = f"₹{float(deal['price']):,.0f}"
+        expiry_note = ""
+
+    original = f"<s>MRP ₹{float(deal['original_price']):,.0f}</s>" if float(deal['original_price']) > float(deal['price']) else f"MRP ₹{float(deal['original_price']):,.0f}"
+    discount = int((1 - float(deal['price'])/float(deal['original_price']))*100) if float(deal['original_price']) > 0 else 0
+
+    msg = f"""
+{title_display}
+💰 {price_display}  ( {original}  |  {discount}% off )
+🏦 {bank}
+📍 Source: {source}
+
+🧠 <b>AI Analysis:</b>
+{analysis_escaped}
+
+⚠️ <b>Flaws Detected:</b>
+{chr(10).join([f'• {f}' for f in flaws]) if flaws else '• None reported'}
+
+💡 <b>Verdict:</b> {verdict}
+{expiry_note}
+    """
+    msg = msg.strip()
+    if len(msg) > 4000:
+        msg = msg[:4000] + "\n\n⚠️ Truncated"
+    return msg
+
+def get_deal_keyboard(deal_id: int, deal_url: str) -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton("🔗 View on Site", url=deal_url)],
+        [InlineKeyboardButton("🔔 Set Alert", callback_data=f"a_{deal_id}"),
+         InlineKeyboardButton("🔄 Alternatives", callback_data=f"alt_{deal_id}")]
+    ]
+    return InlineKeyboardMarkup(buttons)
 
 async def broadcast_worker(app: Application):
     while True:
@@ -764,67 +790,78 @@ async def cleanup_messages(app: Application):
             logger.warning(f"Delete failed: {e}")
         await asyncio.sleep(0.05)
 
-def format_deal_message(deal: dict) -> str:
-    analysis = deal.get('analysis_text') or deal.get('analysis_summary', 'No analysis')
-    title = escape(deal['title'])
-    analysis_escaped = escape(analysis)
-    flaws = [escape(f) for f in deal.get('flaws', [])]
-    verdict = escape(deal.get('verdict', 'Average'))
-    bank = escape(deal.get('bank_offers', 'No bank offers'))
-    source = escape(deal.get('source', 'Unknown'))
+async def check_tracked_products(app: Application):
+    products = await get_tracked_products()
+    for prod in products:
+        html = await safe_fetch_url(prod['product_url'])
+        if not html:
+            continue
+        tree = lxml_html.fromstring(html)
+        price_elem = tree.xpath('//span[contains(@class,"price")] | //div[contains(@class,"price")] | //meta[@property="product:price:amount"]')
+        price = 0.0
+        if price_elem:
+            price_text = price_elem[0].text_content() if hasattr(price_elem[0], 'text_content') else price_elem[0].get('content', '')
+            price = extract_price_fast(price_text)
+        if price <= 0:
+            continue
+        product_key = generate_deal_fingerprint(prod['product_url'], price, "tracked")
+        await record_price_history(product_key, price, "tracked")
+        if prod['last_price'] == 0:
+            await update_tracked_product_price(prod['id'], price)
+            continue
+        if price < prod['last_price'] or (prod['target_price'] > 0 and price <= prod['target_price']):
+            msg = f"🔔 *Price Alert!*\n\n{prod['product_url']}\nPrevious: ₹{prod['last_price']:,.0f}\nNow: ₹{price:,.0f}"
+            try:
+                await app.bot.send_message(chat_id=prod['user_id'], text=msg, parse_mode=ParseMode.MARKDOWN)
+            except Exception as e:
+                logger.error(f"Alert failed: {e}")
+            await update_tracked_product_price(prod['id'], price)
+        else:
+            await update_tracked_product_price(prod['id'], price)
+        await asyncio.sleep(random.uniform(1, 3))
 
-    if deal.get('is_expired'):
-        title_display = f"<s>{title}</s>"
-        price_display = f"<s>₹{float(deal['price']):,.0f}</s>"
-        expiry_note = "\n\n❌ Deal expired • Better alternatives below"
+# ---------- FastAPI app ----------
+telegram_app = Application.builder().token(TOKEN).build()
+scheduler = AsyncIOScheduler()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_db_pool()
+    await init_tables()
+    await telegram_app.initialize()
+    await telegram_app.start()
+    hostname = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
+    if hostname:
+        webhook_url = f"https://{hostname}/webhook"
+        await telegram_app.bot.set_webhook(webhook_url)
+        logger.info(f"Webhook set to {webhook_url}")
     else:
-        title_display = f"<b>{title}</b>"
-        price_display = f"₹{float(deal['price']):,.0f}"
-        expiry_note = ""
+        logger.warning("No RENDER_EXTERNAL_HOSTNAME, skipping webhook")
+    # Start workers
+    for _ in range(3):
+        asyncio.create_task(extraction_worker(telegram_app))
+        asyncio.create_task(analysis_worker(telegram_app))
+        asyncio.create_task(broadcast_worker(telegram_app))
+    # Schedule periodic jobs
+    scheduler.add_job(fetch_and_enqueue, IntervalTrigger(hours=2), max_instances=1, coalesce=True)
+    scheduler.add_job(revalidate_deals, IntervalTrigger(hours=4), args=[telegram_app], max_instances=1, coalesce=True)
+    scheduler.add_job(cleanup_messages, CronTrigger(hour=3, minute=0), args=[telegram_app], max_instances=1, coalesce=True)
+    scheduler.add_job(check_tracked_products, IntervalTrigger(minutes=TRACKED_PRICE_CHECK_INTERVAL_MINUTES), args=[telegram_app], max_instances=1, coalesce=True)
+    scheduler.add_job(retry_failed_jobs, IntervalTrigger(minutes=5), max_instances=1, coalesce=True)
+    scheduler.start()
+    # Immediate fetch on startup (after 10s delay to allow webhook)
+    asyncio.create_task(asyncio.sleep(10))
+    asyncio.create_task(fetch_and_enqueue())
+    yield
+    if scheduler.running:
+        scheduler.shutdown()
+    await telegram_app.stop()
+    if db_pool:
+        await db_pool.close()
+    await close_http_session()
+    await telegram_app.shutdown()
 
-    original = f"<s>MRP ₹{float(deal['original_price']):,.0f}</s>" if float(deal['original_price']) > float(deal['price']) else f"MRP ₹{float(deal['original_price']):,.0f}"
-    discount = int((1 - float(deal['price'])/float(deal['original_price']))*100) if float(deal['original_price']) > 0 else 0
-
-    msg = f"""
-{title_display}
-💰 {price_display}  ( {original}  |  {discount}% off )
-🏦 {bank}
-📍 Source: {source}
-
-🧠 <b>AI Analysis:</b>
-{analysis_escaped}
-
-⚠️ <b>Flaws Detected:</b>
-{chr(10).join([f'• {f}' for f in flaws]) if flaws else '• None reported'}
-
-💡 <b>Verdict:</b> {verdict}
-{expiry_note}
-    """
-    msg = msg.strip()
-    if len(msg) > 4000:
-        msg = msg[:4000] + "\n\n⚠️ Truncated"
-    return msg
-
-def get_deal_keyboard(deal_id: int, deal_url: str) -> InlineKeyboardMarkup:
-    buttons = [
-        [InlineKeyboardButton("🔗 View on Site", url=deal_url)],
-        [InlineKeyboardButton("🔔 Set Alert", callback_data=f"a_{deal_id}"),
-         InlineKeyboardButton("🔄 Alternatives", callback_data=f"alt_{deal_id}")]
-    ]
-    return InlineKeyboardMarkup(buttons)
-
-async def quick_check_page(url: str) -> dict:
-    html = await safe_fetch_url(url)
-    if not html:
-        return {"price": 0, "in_stock": True, "expired": False}
-    tree = lxml_html.fromstring(html)
-    price_elem = tree.xpath('//span[contains(@class,"price")] | //div[contains(@class,"price")]')
-    price = 0.0
-    if price_elem:
-        price = extract_price_fast(price_elem[0].text_content())
-    oos_text = tree.xpath('//*[contains(text(),"out of stock") or contains(text(),"Out of Stock")]')
-    expired = bool(oos_text)
-    return {"price": price, "in_stock": not expired, "expired": expired}
+fastapi_app = FastAPI(lifespan=lifespan)
 
 # ---------- Telegram command handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -875,54 +912,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.message.reply_text("Could not set alert.")
 
-# ---------- FastAPI app ----------
-telegram_app = Application.builder().token(TOKEN).build()
-scheduler = AsyncIOScheduler()
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    await init_db_pool()
-    await init_tables()
-    await telegram_app.initialize()
-    await telegram_app.start()
-    hostname = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
-    if hostname:
-        webhook_url = f"https://{hostname}/webhook"
-        await telegram_app.bot.set_webhook(webhook_url)
-        logger.info(f"Webhook set to {webhook_url}")
-    else:
-        logger.warning("No RENDER_EXTERNAL_HOSTNAME, skipping webhook")
-    # Start workers
-    for _ in range(3):
-        asyncio.create_task(extraction_worker(telegram_app))
-        asyncio.create_task(analysis_worker(telegram_app))
-        asyncio.create_task(broadcast_worker(telegram_app))
-    scheduler.add_job(fetch_and_enqueue, IntervalTrigger(hours=2), max_instances=1, coalesce=True)
-    scheduler.add_job(revalidate_deals, IntervalTrigger(hours=4), args=[telegram_app], max_instances=1, coalesce=True)
-    scheduler.add_job(cleanup_messages, CronTrigger(hour=3, minute=0), args=[telegram_app], max_instances=1, coalesce=True)
-    scheduler.add_job(check_tracked_products, IntervalTrigger(minutes=TRACKED_PRICE_CHECK_INTERVAL_MINUTES), args=[telegram_app], max_instances=1, coalesce=True)
-    scheduler.add_job(retry_failed_jobs, IntervalTrigger(minutes=5), max_instances=1, coalesce=True)
-    scheduler.start()
-    asyncio.create_task(asyncio.sleep(10))
-    asyncio.create_task(fetch_and_enqueue())
-    yield
-    if scheduler.running:
-        scheduler.shutdown()
-    await telegram_app.stop()
-    if db_pool:
-        await db_pool.close()
-    await close_http_session()
-    await telegram_app.shutdown()
-
-fastapi_app = FastAPI(lifespan=lifespan)
-
-# Register handlers
 telegram_app.add_handler(CommandHandler('start', start))
 telegram_app.add_handler(CommandHandler('track', track))
 telegram_app.add_handler(CommandHandler('feedback', feedback))
 telegram_app.add_handler(CommandHandler('cleanup', cleanup_command))
 telegram_app.add_handler(CallbackQueryHandler(button_callback))
 
+# ---------- Webhook endpoints ----------
 @fastapi_app.post("/webhook")
 async def webhook(request: Request, background_tasks: BackgroundTasks):
     body = await request.body()
