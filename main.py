@@ -46,9 +46,7 @@ MIN_DISCOUNT_TO_ANALYZE = 20
 AI_CACHE_TTL_HOURS = 24
 TRACKED_PRICE_CHECK_INTERVAL_MINUTES = 30
 EXTRACTION_TIMEOUT = 15
-# CONFIDENCE_THRESHOLD = 0.7   # CONFIDENCE SCORING IS COMMENTED OUT – WILL ADD LATER
 FAILURE_THRESHOLD = 5
-RETRY_MAX = 3
 DEAD_LETTER_RETRY_DELAYS = [1, 5, 15, 30, 60]
 
 logging.basicConfig(level=logging.INFO)
@@ -174,10 +172,10 @@ async def init_db_pool():
 
 async def init_tables():
     async with db_pool.acquire() as conn:
-        # sent_deals (with optional fingerprint column)
+        # 1. Create sent_deals (no foreign keys yet)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS sent_deals (
-                id BIGSERIAL,
+                id BIGSERIAL PRIMARY KEY,
                 deal_url TEXT UNIQUE NOT NULL,
                 title TEXT,
                 price NUMERIC(12,2),
@@ -195,7 +193,36 @@ async def init_tables():
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_sent_deals_sent_at ON sent_deals(sent_at);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_sent_deals_expired ON sent_deals(is_expired);")
 
-        # Raw snapshots
+        # 2. Create sent_deal_messages (deal_id column without foreign key initially)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS sent_deal_messages (
+                id SERIAL PRIMARY KEY,
+                deal_id BIGINT,
+                user_id BIGINT,
+                message_id INTEGER,
+                chat_id BIGINT,
+                UNIQUE(deal_id, user_id)
+            )
+        """)
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_sent_messages_deal ON sent_deal_messages(deal_id);")
+
+        # 3. Now add the foreign key constraint (sent_deals.id already exists)
+        await conn.execute("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.table_constraints
+                    WHERE constraint_name = 'fk_sent_deal_messages_deal_id'
+                ) THEN
+                    ALTER TABLE sent_deal_messages
+                    ADD CONSTRAINT fk_sent_deal_messages_deal_id
+                    FOREIGN KEY (deal_id) REFERENCES sent_deals(id) ON DELETE CASCADE;
+                END IF;
+            END
+            $$;
+        """)
+
+        # 4. Create other tables
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS deal_snapshots (
                 id BIGSERIAL PRIMARY KEY,
@@ -206,8 +233,6 @@ async def init_tables():
                 captured_at TIMESTAMPTZ
             )
         """)
-
-        # Source health (no confidence column)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS source_health (
                 source TEXT PRIMARY KEY,
@@ -219,8 +244,6 @@ async def init_tables():
                 downgraded BOOLEAN DEFAULT FALSE
             )
         """)
-
-        # Failed jobs queue
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS failed_jobs (
                 id BIGSERIAL PRIMARY KEY,
@@ -232,8 +255,6 @@ async def init_tables():
                 created_at TIMESTAMPTZ
             )
         """)
-
-        # Price history
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS price_history (
                 id BIGSERIAL PRIMARY KEY,
@@ -244,8 +265,6 @@ async def init_tables():
             )
         """)
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_price_history_product_key ON price_history(product_key);")
-
-        # AI analysis cache
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS ai_analysis_cache (
                 url_hash TEXT PRIMARY KEY,
@@ -258,20 +277,11 @@ async def init_tables():
                 created_at TIMESTAMPTZ
             )
         """)
-
-        # sent_deal_messages, users, tracked_products
         await conn.execute("""
-            CREATE TABLE IF NOT EXISTS sent_deal_messages (
-                id SERIAL PRIMARY KEY,
-                deal_id BIGINT REFERENCES sent_deals(id) ON DELETE CASCADE,
-                user_id BIGINT,
-                message_id INTEGER,
-                chat_id BIGINT,
-                UNIQUE(deal_id, user_id)
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY
             )
         """)
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_sent_messages_deal ON sent_deal_messages(deal_id);")
-        await conn.execute("CREATE TABLE IF NOT EXISTS users (user_id BIGINT PRIMARY KEY);")
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS tracked_products (
                 id SERIAL PRIMARY KEY,
@@ -287,7 +297,7 @@ async def init_tables():
 
         logger.info("✅ All tables ready")
 
-# ---------- Database helpers (unchanged) ----------
+# ---------- Database helpers ----------
 async def register_user(user_id: int):
     async with db_pool.acquire() as conn:
         await conn.execute("INSERT INTO users (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING", user_id)
@@ -442,7 +452,7 @@ async def record_price_history(product_key: str, price: float, source: str):
             VALUES ($1,$2,$3,$4)
         """, product_key, price, datetime.now(timezone.utc), source)
 
-# ---------- Fast extraction (confidence logic removed) ----------
+# ---------- Fast extraction (no confidence logic) ----------
 def extract_price_fast(text: str) -> float:
     matches = re.findall(r'[\d,]+(?:\.\d+)?', text.replace(',', ''))
     if matches:
@@ -470,8 +480,7 @@ async def fast_extract_deals_from_html(html_content: str, source: str) -> List[d
                     "title": title, "url": url, "price": price, "original_price": original_price,
                     "bank_offers": "Check site", "rating": "4.0", "source": source
                 })
-        # Other sources (GrabOn, Amazon, Flipkart) would be implemented similarly
-        # This is a simplified version – expand as needed
+        # For other sources, implement similar logic – placeholder
     except Exception as e:
         logger.warning(f"Fast extraction failed for {source}: {e}")
     return deals
@@ -525,7 +534,6 @@ async def extract_deals_with_fallback(source: str, url: str, html: str) -> List[
             await add_failed_job("extract", {"source": source, "url": url, "html_snippet": html[:200]}, "Both fast and AI extraction failed")
         return deals
 
-# ---------- Snapshot storage ----------
 async def store_snapshot(source: str, url: str, html: str, text: str):
     async with db_pool.acquire() as conn:
         await conn.execute("""
@@ -533,7 +541,6 @@ async def store_snapshot(source: str, url: str, html: str, text: str):
             VALUES ($1,$2,$3,$4,$5)
         """, source, url, html, text, datetime.now(timezone.utc))
 
-# ---------- AI Deal Analysis with caching and verification (confidence omitted) ----------
 async def analyze_deal_with_ai(deal: dict) -> dict:
     url_hash = hashlib.md5(deal['url'].encode()).hexdigest()
     async with db_pool.acquire() as conn:
@@ -595,7 +602,6 @@ Generate a SHORT, engaging analysis in Hinglish. Use emojis naturally. Include g
         await add_failed_job("analyze", {"deal": deal}, str(e))
         return {**deal, "analysis_text": "⚠️ Analysis temporarily unavailable", "verdict": "Average", "flaws": [], "alternatives": [], "is_expired": False}
 
-# ---------- Price tracking ----------
 async def check_tracked_products(app: Application):
     products = await get_tracked_products()
     for prod in products:
@@ -704,7 +710,6 @@ async def broadcast_worker(app: Application):
             logger.error(f"Broadcast worker error: {e}")
             await asyncio.sleep(1)
 
-# ---------- Fetch job ----------
 async def fetch_and_enqueue():
     sources = [
         ("DesiDime", "https://www.desidime.com/hot-deals"),
@@ -724,7 +729,6 @@ async def fetch_and_enqueue():
         await extraction_queue.put({'source': source, 'url': url, 'html': html})
         await asyncio.sleep(2)
 
-# ---------- Revalidation ----------
 async def revalidate_deals(app: Application):
     deals = await get_active_deals_to_revalidate()
     for deal in deals:
@@ -750,7 +754,6 @@ async def revalidate_deals(app: Application):
                         logger.error(f"Edit failed: {e}")
         await asyncio.sleep(0.5)
 
-# ---------- Cleanup ----------
 async def cleanup_messages(app: Application):
     old = await delete_old_deals()
     for row in old:
@@ -761,7 +764,6 @@ async def cleanup_messages(app: Application):
             logger.warning(f"Delete failed: {e}")
         await asyncio.sleep(0.05)
 
-# ---------- Formatting helpers ----------
 def format_deal_message(deal: dict) -> str:
     analysis = deal.get('analysis_text') or deal.get('analysis_summary', 'No analysis')
     title = escape(deal['title'])
