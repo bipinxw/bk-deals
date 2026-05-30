@@ -3,38 +3,42 @@ import re
 import asyncio
 import logging
 import json
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 from urllib.parse import urljoin
-from apscheduler.schedulers.background import BackgroundScheduler
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
 import aiohttp
 from bs4 import BeautifulSoup
 import google.generativeai as genai
 from dotenv import load_dotenv
-from flask import Flask, request
+from fastapi import FastAPI, Request, Response
+from supabase import create_client, Client
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from telegram.constants import ParseMode
-from supabase import create_client, Client
 
+# Load environment
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 ADMIN_ID = int(os.getenv("ADMIN_USER_ID", 0))
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+PORT = int(os.environ.get("PORT", 8080))
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Initialize AI and Supabase
 genai.configure(api_key=GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel('gemini-1.5-flash')
-
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ------------------- Supabase helpers -------------------
+# ------------------- Supabase Helpers -------------------
 def register_user(user_id: int):
     supabase.table('users').upsert({'user_id': user_id}, on_conflict='user_id').execute()
 
@@ -84,7 +88,7 @@ def add_tracked_product(user_id: int, url: str):
         'last_check': datetime.utcnow().isoformat()
     }, on_conflict='user_id, product_url').execute()
 
-# ------------------- Scraping (only aiohttp) -------------------
+# ------------------- Scraping (aiohttp only) -------------------
 def extract_price(text: str) -> float:
     match = re.search(r'[\d,]+\.?\d*', text.replace(',', ''))
     return float(match.group()) if match else 0.0
@@ -227,7 +231,7 @@ async def fetch_all_deals() -> List[dict]:
             unique.append(d)
     return unique
 
-# ------------------- AI Analysis (No Cache) -------------------
+# ------------------- AI Analysis -------------------
 async def ai_validate_and_analyze_deal(deal: dict) -> dict:
     live_html = await fetch_html(deal['url'])
     live_text = BeautifulSoup(live_html, 'html.parser').get_text()[:5000] if live_html else "Page not reachable"
@@ -337,7 +341,7 @@ async def broadcast_deal(bot, deal: dict):
     users = get_all_users()
     await asyncio.gather(*[send_deal_to_user(bot, uid, deal) for uid in users])
 
-# ------------------- Background jobs -------------------
+# ------------------- Background Jobs -------------------
 async def fetch_and_broadcast(app: Application):
     logger.info("Fetching deals...")
     deals = await fetch_all_deals()
@@ -377,10 +381,32 @@ async def cleanup_messages(app: Application):
             pass
         await asyncio.sleep(0.05)
 
-# ------------------- Flask webhook -------------------
-flask_app = Flask(__name__)
+# ------------------- FastAPI Webhook -------------------
 telegram_app = Application.builder().token(TOKEN).build()
+scheduler = AsyncIOScheduler()
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    await telegram_app.initialize()
+    webhook_url = f"https://{os.environ.get('RENDER_EXTERNAL_HOSTNAME')}/webhook"
+    await telegram_app.bot.set_webhook(webhook_url)
+    logger.info(f"Webhook set to {webhook_url}")
+    
+    # Start background scheduler
+    scheduler.add_job(lambda: asyncio.create_task(fetch_and_broadcast(telegram_app)), IntervalTrigger(hours=2))
+    scheduler.add_job(lambda: asyncio.create_task(revalidate_deals(telegram_app)), IntervalTrigger(hours=4))
+    scheduler.add_job(lambda: asyncio.create_task(cleanup_messages(telegram_app)), CronTrigger(hour=3, minute=0))
+    scheduler.start()
+    
+    yield
+    # Shutdown
+    scheduler.shutdown()
+    await telegram_app.shutdown()
+
+fastapi_app = FastAPI(lifespan=lifespan)
+
+# ------------------- Handlers -------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(update.effective_user.id)
     await update.message.reply_text("👋 Welcome! You'll receive all deals automatically.")
@@ -421,26 +447,17 @@ telegram_app.add_handler(CommandHandler('feedback', feedback))
 telegram_app.add_handler(CommandHandler('cleanup', cleanup_command))
 telegram_app.add_handler(CallbackQueryHandler(button_callback))
 
-@flask_app.route('/webhook', methods=['POST'])
-async def webhook():
-    update = Update.de_json(request.get_json(force=True), telegram_app.bot)
+@fastapi_app.post("/webhook")
+async def webhook(request: Request):
+    update = Update.de_json(await request.json(), telegram_app.bot)
     await telegram_app.process_update(update)
-    return 'ok'
+    return Response(status_code=200)
 
-async def set_webhook():
-    webhook_url = f"https://{os.environ.get('RENDER_EXTERNAL_HOSTNAME')}/webhook"
-    await telegram_app.bot.set_webhook(webhook_url)
-    logger.info(f"Webhook set to {webhook_url}")
+@fastapi_app.get("/health")
+async def health():
+    return {"status": "alive"}
 
-scheduler = BackgroundScheduler()
-scheduler.add_job(lambda: asyncio.run(fetch_and_broadcast(telegram_app)), IntervalTrigger(hours=2))
-scheduler.add_job(lambda: asyncio.run(revalidate_deals(telegram_app)), IntervalTrigger(hours=4))
-scheduler.add_job(lambda: asyncio.run(cleanup_messages(telegram_app)), CronTrigger(hour=3, minute=0))
-scheduler.start()
-
-if __name__ == '__main__':
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(telegram_app.initialize())
-    loop.run_until_complete(set_webhook())
-    flask_app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
+# ------------------- Main -------------------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(fastapi_app, host="0.0.0.0", port=PORT)
