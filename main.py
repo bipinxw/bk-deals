@@ -15,7 +15,6 @@ from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
 import aiohttp
 import asyncpg
-import google.generativeai as genai
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Response
@@ -29,7 +28,7 @@ load_dotenv()
 
 # ---------- Environment ----------
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 ADMIN_ID = int(os.getenv("ADMIN_USER_ID", 0))
 DATABASE_URL = os.getenv("SUPABASE_DATABASE_URL")
 PORT = int(os.environ.get("PORT", 8080))
@@ -54,47 +53,52 @@ if "sslmode" not in DATABASE_URL.lower():
     separator = "&" if "?" in DATABASE_URL else "?"
     DATABASE_URL += f"{separator}sslmode=require"
 
-# ---------- AI (Gemini 2.5 Flash) ----------
+# ---------- Groq AI ----------
 AI_AVAILABLE = False
-gemini_model = None
-if GEMINI_API_KEY:
-    try:
-        genai.configure(api_key=GEMINI_API_KEY)
-        gemini_model = genai.GenerativeModel('gemini-2.5-flash')   # ✅ current stable free model
-        AI_AVAILABLE = True
-        logger.info("✅ Gemini AI ready (gemini-2.5-flash)")
-    except Exception as e:
-        logger.warning(f"Gemini init failed: {e}")
-else:
-    logger.warning("No GEMINI_API_KEY – AI analysis disabled")
+GROQ_MODEL = "llama-3.3-70b-versatile"   # Free, 1000+ requests/day
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-class DealAnalysis(BaseModel):
-    analysis_text: str
-    verdict: str
-    flaws: List[str]
-    alternatives: List[str]
-    is_expired: bool
-
-async def analyze_with_ai(deal: dict) -> dict:
-    if not AI_AVAILABLE or not gemini_model:
+async def analyze_with_groq(deal: dict) -> dict:
+    if not GROQ_API_KEY:
         return {**deal, "analysis_text": "AI not configured", "verdict": "Average", "flaws": [], "alternatives": []}
-    prompt = f"""Analyze this deal in Hinglish with emojis.
+    prompt = f"""You are a helpful deal analyst. Analyze this deal in Hinglish (mix Hindi and English) with emojis. Keep it short.
+
 Title: {deal['title']}
 Price: ₹{deal['price']}
 MRP: ₹{deal['original_price']}
 Bank offers: {deal.get('bank_offers','None')}
 Source: {deal['source']}
-Output JSON: {{"analysis_text": "...", "verdict": "Excellent Deal/Good Deal/Average/Avoid", "flaws": [], "alternatives": []}}"""
+
+Return ONLY valid JSON with these fields: analysis_text (string), verdict (string: "Excellent Deal"/"Good Deal"/"Average"/"Avoid"), flaws (list of strings), alternatives (list of strings). No extra text."""
+    
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.3,
+        "response_format": {"type": "json_object"}
+    }
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    session = await get_http_session()
     try:
-        response = await asyncio.to_thread(gemini_model.generate_content, prompt)
-        text = response.text.strip()
-        json_match = re.search(r'\{.*\}', text, re.DOTALL)
-        if json_match:
-            data = json.loads(json_match.group())
-            return {**deal, "analysis_text": data.get('analysis_text', ''), "verdict": data.get('verdict', 'Average'),
-                    "flaws": data.get('flaws', []), "alternatives": data.get('alternatives', [])}
+        async with session.post(GROQ_URL, json=payload, headers=headers, timeout=20) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                content = data['choices'][0]['message']['content']
+                result = json.loads(content)
+                return {
+                    **deal,
+                    "analysis_text": result.get('analysis_text', ''),
+                    "verdict": result.get('verdict', 'Average'),
+                    "flaws": result.get('flaws', []),
+                    "alternatives": result.get('alternatives', [])
+                }
+            else:
+                logger.error(f"Groq API error: {resp.status} - {await resp.text()}")
     except Exception as e:
-        logger.error(f"AI failed: {e}")
+        logger.error(f"Groq analysis failed: {e}")
     return {**deal, "analysis_text": "AI analysis temporary unavailable", "verdict": "Average", "flaws": [], "alternatives": []}
 
 # ---------- HTTP session ----------
@@ -139,7 +143,7 @@ async def init_db_pool():
 
 async def ensure_db_schema():
     async with db_pool.acquire() as conn:
-        # Base sent_deals table (if not exists)
+        # Base sent_deals table
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS sent_deals (
                 id BIGSERIAL PRIMARY KEY,
@@ -155,10 +159,8 @@ async def ensure_db_schema():
                 is_expired BOOLEAN DEFAULT FALSE
             )
         """)
-        # Add fingerprint column safely
         await conn.execute("ALTER TABLE sent_deals ADD COLUMN IF NOT EXISTS fingerprint TEXT;")
         await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_sent_deals_fingerprint ON sent_deals(fingerprint);")
-        # sent_deal_messages
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS sent_deal_messages (
                 id SERIAL PRIMARY KEY,
@@ -169,13 +171,11 @@ async def ensure_db_schema():
                 UNIQUE(deal_id, user_id)
             )
         """)
-        # users
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id BIGINT PRIMARY KEY
             )
         """)
-        # tracked_products
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS tracked_products (
                 id SERIAL PRIMARY KEY,
@@ -286,7 +286,6 @@ async def fetch_all_deals() -> List[dict]:
         deals = await extract_grabon(html)
         logger.info(f"GrabOn: {len(deals)} deals")
         all_deals.extend(deals)
-    # Demo deal if nothing found
     if not all_deals:
         all_deals.append({
             "title": "🔥 DEMO DEAL: OnePlus Nord CE 4 (Test) 🔥",
@@ -357,13 +356,11 @@ async def fetch_and_broadcast(app: Application):
         logger.info("Starting deal fetch cycle...")
         deals = await fetch_all_deals()
         for deal in deals:
-            # Duplicate check within 2h
             async with db_pool.acquire() as conn:
                 exists = await conn.fetchval("SELECT 1 FROM sent_deals WHERE deal_url=$1 AND sent_at > NOW() - INTERVAL '2 hours'", deal['url'])
             if exists:
                 continue
-            # AI analysis
-            analyzed = await analyze_with_ai(deal)
+            analyzed = await analyze_with_groq(deal)
             fingerprint = hashlib.sha256(f"{deal['title']}|{deal['price']}|{deal['source']}".encode()).hexdigest()
             deal_id, inserted = await add_sent_deal(
                 analyzed['url'], analyzed['title'], analyzed['price'], analyzed['original_price'],
@@ -379,7 +376,7 @@ async def fetch_and_broadcast(app: Application):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     await register_user(user_id)
-    await update.message.reply_text("👋 Welcome! Deals will be sent soon. Starting immediate fetch...")
+    await update.message.reply_text("👋 Welcome! Fetching deals now...")
     asyncio.create_task(fetch_and_broadcast(context.application))
 
 async def track(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -395,14 +392,13 @@ async def track(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔔 Tracking started (price alerts coming soon)")
 
 async def feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Thanks for your feedback! It helps improve the bot.")
+    await update.message.reply_text("Thanks for your feedback!")
 
 async def cleanup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("Admin only.")
         return
     await update.message.reply_text("🧹 Cleaning old messages...")
-    # Add actual cleanup logic if needed
     await update.message.reply_text("✅ Done.")
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -412,8 +408,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("alt_"):
         await query.message.reply_text("🔄 Alternatives: Check similar products on Amazon/Flipkart.")
     elif data.startswith("alert_"):
-        deal_id = int(data.split("_")[1])
-        await query.message.reply_text("🔔 Alert feature will be fully implemented soon. For now, you can manually track using /track.")
+        await query.message.reply_text("🔔 Alert feature coming soon. Use /track for now.")
 
 # ---------- FastAPI app ----------
 telegram_app = Application.builder().token(TOKEN).build()
