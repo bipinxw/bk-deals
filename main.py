@@ -14,81 +14,147 @@ from apscheduler.triggers.cron import CronTrigger
 import aiohttp
 from bs4 import BeautifulSoup
 import google.generativeai as genai
+import asyncpg
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Response
-from supabase import create_client, Client
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from telegram.constants import ParseMode
 
-# Load environment
+# load_dotenv() is optional; works locally if .env exists, safe on Render
 load_dotenv()
+
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 ADMIN_ID = int(os.getenv("ADMIN_USER_ID", 0))
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+SUPABASE_URL = os.getenv("SUPABASE_URL")          # e.g., https://xxxxx.supabase.co
+SUPABASE_PASSWORD = os.getenv("SUPABASE_PASSWORD")  # from Supabase DB connection string
 PORT = int(os.environ.get("PORT", 8080))
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize AI and Supabase
+# ---------- Validate required environment ----------
+missing = []
+if not TOKEN: missing.append("TELEGRAM_BOT_TOKEN")
+if not GEMINI_API_KEY: missing.append("GEMINI_API_KEY")
+if not SUPABASE_URL: missing.append("SUPABASE_URL")
+if not SUPABASE_PASSWORD: missing.append("SUPABASE_PASSWORD")
+if missing:
+    logger.error(f"Missing environment variables: {', '.join(missing)}")
+    raise SystemExit(1)
+
+# ---------- AI ----------
 genai.configure(api_key=GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel('gemini-1.5-flash')
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ------------------- Supabase Helpers -------------------
-def register_user(user_id: int):
-    supabase.table('users').upsert({'user_id': user_id}, on_conflict='user_id').execute()
+# ---------- PostgreSQL connection pool ----------
+db_pool: asyncpg.Pool = None
 
-def get_all_users():
-    res = supabase.table('users').select('user_id').execute()
-    return [row['user_id'] for row in res.data]
+async def init_db_pool():
+    global db_pool
+    # Extract host from SUPABASE_URL (remove https:// and trailing slash)
+    host = SUPABASE_URL.replace("https://", "").replace("http://", "").rstrip('/')
+    # Build connection string
+    db_url = f"postgresql://postgres:{SUPABASE_PASSWORD}@db.{host}:5432/postgres"
+    try:
+        db_pool = await asyncpg.create_pool(db_url, min_size=1, max_size=5)
+        logger.info("✅ Database connection pool created")
+    except Exception as e:
+        logger.error(f"❌ Database connection failed: {e}")
+        raise
 
-def add_sent_deal(deal_url: str, title: str, price: float, original_price: float,
-                  bank_offers: str, analysis: str, verdict: str, message_id: int, chat_id: int):
-    data = {
-        'deal_url': deal_url,
-        'title': title,
-        'price': price,
-        'original_price': original_price,
-        'bank_offers': bank_offers,
-        'analysis_summary': analysis,
-        'verdict': verdict,
-        'message_id': message_id,
-        'chat_id': chat_id,
-        'sent_at': datetime.utcnow().isoformat(),
-        'last_validated': datetime.utcnow().isoformat(),
-        'is_expired': False
-    }
-    supabase.table('sent_deals').upsert(data, on_conflict='deal_url').execute()
+async def init_tables():
+    """Create tables if they don't exist."""
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY
+            );
+            CREATE TABLE IF NOT EXISTS sent_deals (
+                deal_url TEXT PRIMARY KEY,
+                title TEXT,
+                price REAL,
+                original_price REAL,
+                bank_offers TEXT,
+                analysis_summary TEXT,
+                verdict TEXT,
+                message_id INTEGER,
+                chat_id BIGINT,
+                sent_at TIMESTAMPTZ,
+                last_validated TIMESTAMPTZ,
+                is_expired BOOLEAN DEFAULT FALSE
+            );
+            CREATE TABLE IF NOT EXISTS tracked_products (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT REFERENCES users(user_id),
+                product_url TEXT,
+                target_price REAL,
+                last_price REAL,
+                last_check TIMESTAMPTZ,
+                UNIQUE(user_id, product_url)
+            );
+        """)
+        logger.info("✅ Database tables ready")
 
-def update_deal_expiry(deal_url: str, is_expired: bool):
-    supabase.table('sent_deals').update({
-        'is_expired': is_expired,
-        'last_validated': datetime.utcnow().isoformat()
-    }).eq('deal_url', deal_url).execute()
+# ---------- Database helpers ----------
+async def register_user(user_id: int):
+    async with db_pool.acquire() as conn:
+        await conn.execute("INSERT INTO users (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING", user_id)
 
-def get_all_active_deals():
-    res = supabase.table('sent_deals').select('*').eq('is_expired', False).execute()
-    return res.data
+async def get_all_users():
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT user_id FROM users")
+        return [r['user_id'] for r in rows]
 
-def delete_old_deals(cutoff_iso: str):
-    res = supabase.table('sent_deals').select('deal_url, chat_id, message_id').lt('sent_at', cutoff_iso).execute()
-    supabase.table('sent_deals').delete().lt('sent_at', cutoff_iso).execute()
-    return res.data
+async def add_sent_deal(deal_url: str, title: str, price: float, original_price: float,
+                        bank_offers: str, analysis: str, verdict: str, message_id: int, chat_id: int):
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO sent_deals 
+                (deal_url, title, price, original_price, bank_offers, analysis_summary, verdict,
+                 message_id, chat_id, sent_at, last_validated, is_expired)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            ON CONFLICT (deal_url) DO UPDATE SET
+                title = EXCLUDED.title,
+                price = EXCLUDED.price,
+                original_price = EXCLUDED.original_price,
+                bank_offers = EXCLUDED.bank_offers,
+                analysis_summary = EXCLUDED.analysis_summary,
+                verdict = EXCLUDED.verdict,
+                message_id = EXCLUDED.message_id,
+                chat_id = EXCLUDED.chat_id,
+                sent_at = EXCLUDED.sent_at,
+                last_validated = EXCLUDED.last_validated,
+                is_expired = EXCLUDED.is_expired
+        """, deal_url, title, price, original_price, bank_offers, analysis, verdict,
+            message_id, chat_id, datetime.utcnow().isoformat(), datetime.utcnow().isoformat(), False)
 
-def add_tracked_product(user_id: int, url: str):
-    supabase.table('tracked_products').upsert({
-        'user_id': user_id,
-        'product_url': url,
-        'target_price': 0,
-        'last_price': 0,
-        'last_check': datetime.utcnow().isoformat()
-    }, on_conflict='user_id, product_url').execute()
+async def update_deal_expiry(deal_url: str, is_expired: bool):
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE sent_deals SET is_expired=$1, last_validated=$2 WHERE deal_url=$3",
+                           is_expired, datetime.utcnow().isoformat(), deal_url)
 
-# ------------------- Scraping (aiohttp only) -------------------
+async def get_all_active_deals():
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM sent_deals WHERE is_expired = FALSE")
+        return [dict(r) for r in rows]
+
+async def delete_old_deals(cutoff_iso: str):
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT deal_url, chat_id, message_id FROM sent_deals WHERE sent_at < $1", cutoff_iso)
+        await conn.execute("DELETE FROM sent_deals WHERE sent_at < $1", cutoff_iso)
+        return [dict(r) for r in rows]
+
+async def add_tracked_product(user_id: int, url: str):
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO tracked_products (user_id, product_url, target_price, last_price, last_check)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (user_id, product_url) DO UPDATE SET last_check = EXCLUDED.last_check
+        """, user_id, url, 0, 0, datetime.utcnow().isoformat())
+
+# ---------- Scraping (aiohttp only) ----------
 def extract_price(text: str) -> float:
     match = re.search(r'[\d,]+\.?\d*', text.replace(',', ''))
     return float(match.group()) if match else 0.0
@@ -231,7 +297,7 @@ async def fetch_all_deals() -> List[dict]:
             unique.append(d)
     return unique
 
-# ------------------- AI Analysis -------------------
+# ---------- AI Analysis ----------
 async def ai_validate_and_analyze_deal(deal: dict) -> dict:
     live_html = await fetch_html(deal['url'])
     live_text = BeautifulSoup(live_html, 'html.parser').get_text()[:5000] if live_html else "Page not reachable"
@@ -286,7 +352,7 @@ Be honest. If the page shows 'out of stock', 'deal ended', or price > MRP, set i
     enriched['is_expired'] = ai_data.get('is_expired', False)
     return enriched
 
-# ------------------- Message Formatting -------------------
+# ---------- Message Formatting ----------
 def format_deal_message(deal: dict) -> str:
     if deal.get('is_expired'):
         title = f"<s>{deal['title']}</s>"
@@ -325,29 +391,31 @@ def get_deal_keyboard(deal: dict) -> InlineKeyboardMarkup:
         buttons[1].append(InlineKeyboardButton("👎 Not Interested", callback_data=f"notint_{deal['url']}"))
     return InlineKeyboardMarkup(buttons)
 
-# ------------------- Broadcasting -------------------
+# ---------- Broadcasting ----------
 async def send_deal_to_user(bot, user_id: int, deal: dict):
     msg = format_deal_message(deal)
     keyboard = get_deal_keyboard(deal)
     try:
         sent = await bot.send_message(chat_id=user_id, text=msg, parse_mode=ParseMode.HTML, reply_markup=keyboard)
-        add_sent_deal(deal['url'], deal['title'], deal['price'], deal['original_price'],
-                      deal.get('bank_offers', ''), deal.get('analysis_text', ''), deal.get('verdict', 'Average'),
-                      sent.message_id, user_id)
+        await add_sent_deal(deal['url'], deal['title'], deal['price'], deal['original_price'],
+                            deal.get('bank_offers', ''), deal.get('analysis_text', ''), deal.get('verdict', 'Average'),
+                            sent.message_id, user_id)
     except Exception as e:
         logger.error(f"Failed to send to {user_id}: {e}")
 
 async def broadcast_deal(bot, deal: dict):
-    users = get_all_users()
+    users = await get_all_users()
     await asyncio.gather(*[send_deal_to_user(bot, uid, deal) for uid in users])
 
-# ------------------- Background Jobs -------------------
+# ---------- Background Jobs ----------
 async def fetch_and_broadcast(app: Application):
     logger.info("Fetching deals...")
     deals = await fetch_all_deals()
     for deal in deals:
-        existing = supabase.table('sent_deals').select('deal_url').eq('deal_url', deal['url']).gte('sent_at', (datetime.utcnow() - timedelta(hours=2)).isoformat()).execute()
-        if existing.data:
+        # Duplicate check within 2 hours
+        async with db_pool.acquire() as conn:
+            exists = await conn.fetchval("SELECT 1 FROM sent_deals WHERE deal_url=$1 AND sent_at > NOW() - INTERVAL '2 hours'", deal['url'])
+        if exists:
             continue
         enriched = await ai_validate_and_analyze_deal(deal)
         if enriched.get('is_expired'):
@@ -356,11 +424,11 @@ async def fetch_and_broadcast(app: Application):
         await asyncio.sleep(1)
 
 async def revalidate_deals(app: Application):
-    deals = get_all_active_deals()
+    deals = await get_all_active_deals()
     for deal in deals:
         refreshed = await ai_validate_and_analyze_deal(deal)
         if refreshed.get('is_expired'):
-            update_deal_expiry(deal['deal_url'], True)
+            await update_deal_expiry(deal['deal_url'], True)
             try:
                 expired_deal = {**deal, 'is_expired': True}
                 new_text = format_deal_message(expired_deal)
@@ -373,7 +441,7 @@ async def revalidate_deals(app: Application):
 
 async def cleanup_messages(app: Application):
     cutoff = datetime.utcnow() - timedelta(days=60)
-    old = delete_old_deals(cutoff.isoformat())
+    old = await delete_old_deals(cutoff.isoformat())
     for row in old:
         try:
             await app.bot.delete_message(chat_id=row['chat_id'], message_id=row['message_id'])
@@ -381,41 +449,46 @@ async def cleanup_messages(app: Application):
             pass
         await asyncio.sleep(0.05)
 
-# ------------------- FastAPI Webhook -------------------
+# ---------- FastAPI Webhook ----------
 telegram_app = Application.builder().token(TOKEN).build()
 scheduler = AsyncIOScheduler()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
+    await init_db_pool()
+    await init_tables()
     await telegram_app.initialize()
     webhook_url = f"https://{os.environ.get('RENDER_EXTERNAL_HOSTNAME')}/webhook"
     await telegram_app.bot.set_webhook(webhook_url)
     logger.info(f"Webhook set to {webhook_url}")
     
-    # Start background scheduler
     scheduler.add_job(lambda: asyncio.create_task(fetch_and_broadcast(telegram_app)), IntervalTrigger(hours=2))
     scheduler.add_job(lambda: asyncio.create_task(revalidate_deals(telegram_app)), IntervalTrigger(hours=4))
     scheduler.add_job(lambda: asyncio.create_task(cleanup_messages(telegram_app)), CronTrigger(hour=3, minute=0))
     scheduler.start()
     
     yield
+    
     # Shutdown
     scheduler.shutdown()
+    if db_pool:
+        await db_pool.close()
     await telegram_app.shutdown()
 
 fastapi_app = FastAPI(lifespan=lifespan)
 
-# ------------------- Handlers -------------------
+# ---------- Command Handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    register_user(update.effective_user.id)
+    user_id = update.effective_user.id
+    await register_user(user_id)
     await update.message.reply_text("👋 Welcome! You'll receive all deals automatically.")
 
 async def track(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Usage: /track <url>")
         return
-    add_tracked_product(update.effective_user.id, context.args[0])
+    await add_tracked_product(update.effective_user.id, context.args[0])
     await update.message.reply_text("🔔 Tracking started.")
 
 async def feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -434,7 +507,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
     if data.startswith("alert_"):
-        add_tracked_product(query.from_user.id, data[6:])
+        await add_tracked_product(query.from_user.id, data[6:])
         await query.edit_message_text("🔔 Alert set.")
     elif data.startswith("alt_"):
         await query.edit_message_text("🔄 Alternatives: Check similar products.")
@@ -457,7 +530,6 @@ async def webhook(request: Request):
 async def health():
     return {"status": "alive"}
 
-# ------------------- Main -------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(fastapi_app, host="0.0.0.0", port=PORT)
