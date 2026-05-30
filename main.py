@@ -21,14 +21,13 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from telegram.constants import ParseMode
 
-# load_dotenv() is optional; works locally if .env exists, safe on Render
+# Load environment
 load_dotenv()
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 ADMIN_ID = int(os.getenv("ADMIN_USER_ID", 0))
-SUPABASE_URL = os.getenv("SUPABASE_URL")          # e.g., https://xxxxx.supabase.co
-SUPABASE_PASSWORD = os.getenv("SUPABASE_PASSWORD")  # from Supabase DB connection string
+DATABASE_URL = os.getenv("SUPABASE_DATABASE_URL")  # Full connection string
 PORT = int(os.environ.get("PORT", 8080))
 
 logging.basicConfig(level=logging.INFO)
@@ -38,11 +37,15 @@ logger = logging.getLogger(__name__)
 missing = []
 if not TOKEN: missing.append("TELEGRAM_BOT_TOKEN")
 if not GEMINI_API_KEY: missing.append("GEMINI_API_KEY")
-if not SUPABASE_URL: missing.append("SUPABASE_URL")
-if not SUPABASE_PASSWORD: missing.append("SUPABASE_PASSWORD")
+if not DATABASE_URL: missing.append("SUPABASE_DATABASE_URL")
 if missing:
     logger.error(f"Missing environment variables: {', '.join(missing)}")
     raise SystemExit(1)
+
+# Ensure SSL is enabled for Supabase
+if "ssl=" not in DATABASE_URL:
+    DATABASE_URL += "?ssl=require"
+    logger.info("Added ssl=require to database URL")
 
 # ---------- AI ----------
 genai.configure(api_key=GEMINI_API_KEY)
@@ -53,12 +56,8 @@ db_pool: asyncpg.Pool = None
 
 async def init_db_pool():
     global db_pool
-    # Extract host from SUPABASE_URL (remove https:// and trailing slash)
-    host = SUPABASE_URL.replace("https://", "").replace("http://", "").rstrip('/')
-    # Build connection string
-    db_url = f"postgresql://postgres:{SUPABASE_PASSWORD}@db.{host}:5432/postgres"
     try:
-        db_pool = await asyncpg.create_pool(db_url, min_size=1, max_size=5)
+        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
         logger.info("✅ Database connection pool created")
     except Exception as e:
         logger.error(f"❌ Database connection failed: {e}")
