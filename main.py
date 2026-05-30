@@ -55,11 +55,12 @@ if "sslmode" not in DATABASE_URL.lower():
 
 # ---------- Groq AI ----------
 AI_AVAILABLE = False
-GROQ_MODEL = "llama-3.3-70b-versatile"   # Free, 1000+ requests/day
+GROQ_MODEL = "llama-3.3-70b-versatile"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 async def analyze_with_groq(deal: dict) -> dict:
     if not GROQ_API_KEY:
+        logger.warning("GROQ_API_KEY not set – skipping AI")
         return {**deal, "analysis_text": "AI not configured", "verdict": "Average", "flaws": [], "alternatives": []}
     prompt = f"""You are a helpful deal analyst. Analyze this deal in Hinglish (mix Hindi and English) with emojis. Keep it short.
 
@@ -159,8 +160,10 @@ async def ensure_db_schema():
                 is_expired BOOLEAN DEFAULT FALSE
             )
         """)
+        # Add fingerprint column safely
         await conn.execute("ALTER TABLE sent_deals ADD COLUMN IF NOT EXISTS fingerprint TEXT;")
         await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_sent_deals_fingerprint ON sent_deals(fingerprint);")
+        # sent_deal_messages
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS sent_deal_messages (
                 id SERIAL PRIMARY KEY,
@@ -171,11 +174,13 @@ async def ensure_db_schema():
                 UNIQUE(deal_id, user_id)
             )
         """)
+        # users
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id BIGINT PRIMARY KEY
             )
         """)
+        # tracked_products
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS tracked_products (
                 id SERIAL PRIMARY KEY,
@@ -331,6 +336,7 @@ def get_keyboard(deal_id: int, deal_url: str) -> InlineKeyboardMarkup:
 
 async def broadcast_deal(bot, deal: dict, deal_id: int):
     users = await get_all_users()
+    logger.info(f"Broadcasting to {len(users)} users")
     if not users:
         logger.warning("No users registered")
         return
@@ -356,9 +362,11 @@ async def fetch_and_broadcast(app: Application):
         logger.info("Starting deal fetch cycle...")
         deals = await fetch_all_deals()
         for deal in deals:
+            # Duplicate check within 2h
             async with db_pool.acquire() as conn:
                 exists = await conn.fetchval("SELECT 1 FROM sent_deals WHERE deal_url=$1 AND sent_at > NOW() - INTERVAL '2 hours'", deal['url'])
             if exists:
+                logger.info(f"Deal already sent recently: {deal['title'][:50]}")
                 continue
             analyzed = await analyze_with_groq(deal)
             fingerprint = hashlib.sha256(f"{deal['title']}|{deal['price']}|{deal['source']}".encode()).hexdigest()
@@ -368,16 +376,53 @@ async def fetch_and_broadcast(app: Application):
                 fingerprint
             )
             if inserted:
+                logger.info(f"New deal inserted: {analyzed['title'][:50]} (id={deal_id})")
                 await broadcast_deal(app.bot, analyzed, deal_id)
+            else:
+                logger.info(f"Deal already in DB (not inserted): {analyzed['title'][:50]}")
             await asyncio.sleep(1)
         logger.info("Fetch cycle completed")
 
-# ---------- Telegram handlers ----------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---------- Test command ----------
+async def test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     await register_user(user_id)
+    # Create test deal
+    test_deal = {
+        "title": "🧪 TEST DEAL – Bot is alive",
+        "url": "https://example.com",
+        "price": 999,
+        "original_price": 1999,
+        "bank_offers": "Test offer",
+        "source": "Test",
+        "analysis_text": "This is a test message to confirm the broadcast pipeline works.",
+        "verdict": "Good Deal",
+        "flaws": [],
+        "alternatives": []
+    }
+    fingerprint = hashlib.sha256(b"test_deal_fingerprint").hexdigest()
+    deal_id, inserted = await add_sent_deal(
+        test_deal['url'], test_deal['title'], test_deal['price'], test_deal['original_price'],
+        test_deal['bank_offers'], test_deal['analysis_text'], test_deal['verdict'], fingerprint
+    )
+    if inserted:
+        await broadcast_deal(context.application.bot, test_deal, deal_id)
+        await update.message.reply_text("✅ Test deal broadcast sent.")
+    else:
+        await update.message.reply_text("⚠️ Test deal already exists in DB – not re-broadcast.")
+
+# ---------- Regular handlers ----------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    logger.info(f"/start from {user_id}")
+    await register_user(user_id)
     await update.message.reply_text("👋 Welcome! Fetching deals now...")
-    asyncio.create_task(fetch_and_broadcast(context.application))
+    try:
+        asyncio.create_task(fetch_and_broadcast(context.application))
+        logger.info("Broadcast task created")
+    except Exception as e:
+        logger.exception(f"Failed creating task: {e}")
+        await update.message.reply_text("⚠️ Could not start fetch. Check logs.")
 
 async def track(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -442,6 +487,7 @@ async def lifespan(app: FastAPI):
 fastapi_app = FastAPI(lifespan=lifespan)
 
 telegram_app.add_handler(CommandHandler('start', start))
+telegram_app.add_handler(CommandHandler('test', test))
 telegram_app.add_handler(CommandHandler('track', track))
 telegram_app.add_handler(CommandHandler('feedback', feedback))
 telegram_app.add_handler(CommandHandler('cleanup', cleanup_command))
