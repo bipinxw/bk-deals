@@ -387,7 +387,6 @@ async def fetch_and_broadcast(app: Application):
 async def test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     await register_user(user_id)
-    # Create test deal
     test_deal = {
         "title": "🧪 TEST DEAL – Bot is alive",
         "url": "https://example.com",
@@ -410,6 +409,10 @@ async def test(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Test deal broadcast sent.")
     else:
         await update.message.reply_text("⚠️ Test deal already exists in DB – not re-broadcast.")
+
+# ---------- Ping command ----------
+async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("pong")
 
 # ---------- Regular handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -488,6 +491,7 @@ fastapi_app = FastAPI(lifespan=lifespan)
 
 telegram_app.add_handler(CommandHandler('start', start))
 telegram_app.add_handler(CommandHandler('test', test))
+telegram_app.add_handler(CommandHandler('ping', ping))
 telegram_app.add_handler(CommandHandler('track', track))
 telegram_app.add_handler(CommandHandler('feedback', feedback))
 telegram_app.add_handler(CommandHandler('cleanup', cleanup_command))
@@ -504,7 +508,7 @@ async def webhook_health():
     return {"status": "ok"}
 
 @fastapi_app.get("/ping")
-async def ping():
+async def ping_health():
     return {"status": "pong"}
 
 if __name__ == "__main__":
