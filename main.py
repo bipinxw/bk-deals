@@ -172,7 +172,7 @@ async def init_db_pool():
 
 async def init_tables():
     async with db_pool.acquire() as conn:
-        # 1. Create sent_deals (no foreign keys yet)
+        # 1. sent_deals (no foreign keys)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS sent_deals (
                 id BIGSERIAL PRIMARY KEY,
@@ -193,7 +193,22 @@ async def init_tables():
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_sent_deals_sent_at ON sent_deals(sent_at);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_sent_deals_expired ON sent_deals(is_expired);")
 
-        # 2. Create sent_deal_messages (deal_id column without foreign key initially)
+        # 2. Drop any existing foreign key constraint on sent_deal_messages (safe migration)
+        await conn.execute("""
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.table_constraints
+                    WHERE constraint_name = 'fk_sent_deal_messages_deal_id'
+                    AND table_name = 'sent_deal_messages'
+                ) THEN
+                    ALTER TABLE sent_deal_messages DROP CONSTRAINT fk_sent_deal_messages_deal_id;
+                END IF;
+            END
+            $$;
+        """)
+
+        # 3. sent_deal_messages (no foreign key constraint)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS sent_deal_messages (
                 id SERIAL PRIMARY KEY,
@@ -206,23 +221,7 @@ async def init_tables():
         """)
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_sent_messages_deal ON sent_deal_messages(deal_id);")
 
-        # 3. Now add the foreign key constraint (sent_deals.id already exists)
-        await conn.execute("""
-            DO $$
-            BEGIN
-                IF NOT EXISTS (
-                    SELECT 1 FROM information_schema.table_constraints
-                    WHERE constraint_name = 'fk_sent_deal_messages_deal_id'
-                ) THEN
-                    ALTER TABLE sent_deal_messages
-                    ADD CONSTRAINT fk_sent_deal_messages_deal_id
-                    FOREIGN KEY (deal_id) REFERENCES sent_deals(id) ON DELETE CASCADE;
-                END IF;
-            END
-            $$;
-        """)
-
-        # 4. Create other tables
+        # 4. Other tables
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS deal_snapshots (
                 id BIGSERIAL PRIMARY KEY,
@@ -297,7 +296,7 @@ async def init_tables():
 
         logger.info("✅ All tables ready")
 
-# ---------- Database helpers ----------
+# ---------- Database helpers (unchanged) ----------
 async def register_user(user_id: int):
     async with db_pool.acquire() as conn:
         await conn.execute("INSERT INTO users (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING", user_id)
@@ -452,7 +451,7 @@ async def record_price_history(product_key: str, price: float, source: str):
             VALUES ($1,$2,$3,$4)
         """, product_key, price, datetime.now(timezone.utc), source)
 
-# ---------- Fast extraction (no confidence logic) ----------
+# ---------- Fast extraction (no confidence) ----------
 def extract_price_fast(text: str) -> float:
     matches = re.findall(r'[\d,]+(?:\.\d+)?', text.replace(',', ''))
     if matches:
@@ -480,7 +479,8 @@ async def fast_extract_deals_from_html(html_content: str, source: str) -> List[d
                     "title": title, "url": url, "price": price, "original_price": original_price,
                     "bank_offers": "Check site", "rating": "4.0", "source": source
                 })
-        # For other sources, implement similar logic – placeholder
+        # For other sources, similar logic would be added (GrabOn, Amazon, Flipkart)
+        # For brevity, we keep the structure – in production you'd expand.
     except Exception as e:
         logger.warning(f"Fast extraction failed for {source}: {e}")
     return deals
@@ -632,7 +632,7 @@ async def check_tracked_products(app: Application):
             await update_tracked_product_price(prod['id'], price)
         await asyncio.sleep(random.uniform(1, 3))
 
-# ---------- Queues ----------
+# ---------- Queues and workers ----------
 extraction_queue = asyncio.Queue()
 analysis_queue = asyncio.Queue()
 broadcast_queue = asyncio.Queue()
@@ -826,7 +826,7 @@ async def quick_check_page(url: str) -> dict:
     expired = bool(oos_text)
     return {"price": price, "in_stock": not expired, "expired": expired}
 
-# ---------- Telegram handlers ----------
+# ---------- Telegram command handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     await register_user(user_id)
