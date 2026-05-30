@@ -11,7 +11,6 @@ from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
 import aiohttp
 from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright
 import google.generativeai as genai
 from dotenv import load_dotenv
 from flask import Flask, request
@@ -20,7 +19,6 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 from telegram.constants import ParseMode
 from supabase import create_client, Client
 
-# ---------- Load environment ----------
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -28,18 +26,15 @@ ADMIN_ID = int(os.getenv("ADMIN_USER_ID", 0))
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-# ---------- Logging ----------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------- AI ----------
 genai.configure(api_key=GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel('gemini-1.5-flash')
 
-# ---------- Supabase client ----------
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ---------- Helper functions for Supabase ----------
+# ------------------- Supabase helpers -------------------
 def register_user(user_id: int):
     supabase.table('users').upsert({'user_id': user_id}, on_conflict='user_id').execute()
 
@@ -76,7 +71,6 @@ def get_all_active_deals():
     return res.data
 
 def delete_old_deals(cutoff_iso: str):
-    # First get messages for deletion (chat_id, message_id) – return them
     res = supabase.table('sent_deals').select('deal_url, chat_id, message_id').lt('sent_at', cutoff_iso).execute()
     supabase.table('sent_deals').delete().lt('sent_at', cutoff_iso).execute()
     return res.data
@@ -90,38 +84,24 @@ def add_tracked_product(user_id: int, url: str):
         'last_check': datetime.utcnow().isoformat()
     }, on_conflict='user_id, product_url').execute()
 
-# ---------- Scraping (using html.parser) ----------
+# ------------------- Scraping (only aiohttp) -------------------
 def extract_price(text: str) -> float:
     match = re.search(r'[\d,]+\.?\d*', text.replace(',', ''))
     return float(match.group()) if match else 0.0
 
-async def fetch_html_playwright(url: str) -> Optional[str]:
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context(user_agent="Mozilla/5.0")
-            page = await context.new_page()
-            await page.goto(url, wait_until="domcontentloaded", timeout=15000)
-            html = await page.content()
-            await browser.close()
-            return html
-    except Exception as e:
-        logger.error(f"Playwright error {url}: {e}")
-        return None
-
-async def fetch_html_aiohttp(url: str) -> Optional[str]:
+async def fetch_html(url: str) -> Optional[str]:
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10) as resp:
                 if resp.status == 200:
                     return await resp.text()
     except Exception as e:
-        logger.error(f"Aiohttp error {url}: {e}")
+        logger.error(f"Fetch error {url}: {e}")
     return None
 
 async def fetch_deals_from_desidime() -> List[dict]:
     deals = []
-    html = await fetch_html_aiohttp("https://www.desidime.com/hot-deals")
+    html = await fetch_html("https://www.desidime.com/hot-deals")
     if not html:
         return deals
     soup = BeautifulSoup(html, 'html.parser')
@@ -134,18 +114,15 @@ async def fetch_deals_from_desidime() -> List[dict]:
         price_elem = item.select_one(".price")
         price = extract_price(price_elem.get_text(strip=True)) if price_elem else 0
         original_price = price * 1.3
-        bank_offers = "Check site for bank offers"
-        rating = item.select_one(".rating-value")
-        rating = rating.get_text(strip=True) if rating else "4.0"
         deals.append({
             "title": title, "url": url, "price": price, "original_price": original_price,
-            "bank_offers": bank_offers, "rating": rating, "source": "DesiDime"
+            "bank_offers": "Check site for bank offers", "rating": "4.0", "source": "DesiDime"
         })
     return deals
 
 async def fetch_deals_from_grabon() -> List[dict]:
     deals = []
-    html = await fetch_html_aiohttp("https://www.grabon.in/deals/")
+    html = await fetch_html("https://www.grabon.in/deals/")
     if not html:
         return deals
     soup = BeautifulSoup(html, 'html.parser')
@@ -168,7 +145,7 @@ async def fetch_deals_from_grabon() -> List[dict]:
 
 async def fetch_deals_from_amazon() -> List[dict]:
     deals = []
-    html = await fetch_html_playwright("https://www.amazon.in/deals")
+    html = await fetch_html("https://www.amazon.in/deals")
     if not html:
         return deals
     soup = BeautifulSoup(html, 'html.parser')
@@ -192,7 +169,7 @@ async def fetch_deals_from_amazon() -> List[dict]:
 
 async def fetch_deals_from_flipkart() -> List[dict]:
     deals = []
-    html = await fetch_html_playwright("https://www.flipkart.com/offers-store")
+    html = await fetch_html("https://www.flipkart.com/offers-store")
     if not html:
         return deals
     soup = BeautifulSoup(html, 'html.parser')
@@ -235,8 +212,8 @@ async def fetch_deals_from_reddit() -> List[dict]:
     return deals
 
 async def fetch_all_deals() -> List[dict]:
-    tasks = [fetch_deals_from_desidime(), fetch_deals_from_grabon(), fetch_deals_from_amazon(),
-             fetch_deals_from_flipkart(), fetch_deals_from_reddit()]
+    tasks = [fetch_deals_from_desidime(), fetch_deals_from_grabon(),
+             fetch_deals_from_amazon(), fetch_deals_from_flipkart(), fetch_deals_from_reddit()]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     all_deals = []
     for res in results:
@@ -250,14 +227,9 @@ async def fetch_all_deals() -> List[dict]:
             unique.append(d)
     return unique
 
-# ---------- AI Analysis (with emojis) ----------
-# (We'll reuse the same robust function from earlier; but to save space, I'm including a condensed version)
-# The full function is identical to the previous answer's ai_validate_and_analyze_deal.
-# To avoid repetition, I'll include a working implementation below.
+# ------------------- AI Analysis (No Cache) -------------------
 async def ai_validate_and_analyze_deal(deal: dict) -> dict:
-    # Cache check (optional – we skip for brevity, but you can add ChromaDB if desired)
-    # For now, always analyse fresh.
-    live_html = await fetch_html_playwright(deal['url']) or await fetch_html_aiohttp(deal['url'])
+    live_html = await fetch_html(deal['url'])
     live_text = BeautifulSoup(live_html, 'html.parser').get_text()[:5000] if live_html else "Page not reachable"
 
     prompt = f"""You are an expert Indian deal analyst. Analyse the following deal and the live page content.
@@ -310,7 +282,7 @@ Be honest. If the page shows 'out of stock', 'deal ended', or price > MRP, set i
     enriched['is_expired'] = ai_data.get('is_expired', False)
     return enriched
 
-# ---------- Telegram message formatting ----------
+# ------------------- Message Formatting -------------------
 def format_deal_message(deal: dict) -> str:
     if deal.get('is_expired'):
         title = f"<s>{deal['title']}</s>"
@@ -320,10 +292,8 @@ def format_deal_message(deal: dict) -> str:
         title = f"<b>{deal['title']}</b>"
         price = f"₹{deal['price']:,.0f}"
         expiry_note = ""
-
     original = f"<s>MRP ₹{deal['original_price']:,.0f}</s>" if deal['original_price'] > deal['price'] else f"MRP ₹{deal['original_price']:,.0f}"
     discount = int((1 - deal['price']/deal['original_price'])*100) if deal['original_price'] > 0 else 0
-
     msg = f"""
 {title}
 💰 {price}  ( {original}  |  {discount}% off )
@@ -351,7 +321,7 @@ def get_deal_keyboard(deal: dict) -> InlineKeyboardMarkup:
         buttons[1].append(InlineKeyboardButton("👎 Not Interested", callback_data=f"notint_{deal['url']}"))
     return InlineKeyboardMarkup(buttons)
 
-# ---------- Broadcast ----------
+# ------------------- Broadcasting -------------------
 async def send_deal_to_user(bot, user_id: int, deal: dict):
     msg = format_deal_message(deal)
     keyboard = get_deal_keyboard(deal)
@@ -367,12 +337,11 @@ async def broadcast_deal(bot, deal: dict):
     users = get_all_users()
     await asyncio.gather(*[send_deal_to_user(bot, uid, deal) for uid in users])
 
-# ---------- Background jobs ----------
+# ------------------- Background jobs -------------------
 async def fetch_and_broadcast(app: Application):
     logger.info("Fetching deals...")
     deals = await fetch_all_deals()
     for deal in deals:
-        # Duplicate check within 2h
         existing = supabase.table('sent_deals').select('deal_url').eq('deal_url', deal['url']).gte('sent_at', (datetime.utcnow() - timedelta(hours=2)).isoformat()).execute()
         if existing.data:
             continue
@@ -408,32 +377,29 @@ async def cleanup_messages(app: Application):
             pass
         await asyncio.sleep(0.05)
 
-# ---------- Flask webhook ----------
+# ------------------- Flask webhook -------------------
 flask_app = Flask(__name__)
 telegram_app = Application.builder().token(TOKEN).build()
 
-# Telegram command handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    register_user(user_id)
-    await update.message.reply_text("👋 Welcome! You'll now receive all deals automatically.")
+    register_user(update.effective_user.id)
+    await update.message.reply_text("👋 Welcome! You'll receive all deals automatically.")
 
 async def track(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Usage: /track <url>")
         return
-    url = context.args[0]
-    add_tracked_product(update.effective_user.id, url)
-    await update.message.reply_text(f"🔔 Tracking started for {url[:80]}")
+    add_tracked_product(update.effective_user.id, context.args[0])
+    await update.message.reply_text("🔔 Tracking started.")
 
 async def feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Thanks for your feedback! It helps improve the bot.")
+    await update.message.reply_text("Thanks for your feedback!")
 
 async def cleanup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("Admin only.")
         return
-    await update.message.reply_text("🧹 Cleaning old messages...")
+    await update.message.reply_text("🧹 Cleaning...")
     await cleanup_messages(context.application)
     await update.message.reply_text("✅ Done.")
 
@@ -442,13 +408,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
     if data.startswith("alert_"):
-        url = data[6:]
-        add_tracked_product(query.from_user.id, url)
-        await query.edit_message_text(f"🔔 Alert set for {url[:50]}")
+        add_tracked_product(query.from_user.id, data[6:])
+        await query.edit_message_text("🔔 Alert set.")
     elif data.startswith("alt_"):
-        await query.edit_message_text("🔄 Alternatives: Check similar products on Amazon/Flipkart or wait for better deals.")
+        await query.edit_message_text("🔄 Alternatives: Check similar products.")
     elif data.startswith("notint_"):
-        await query.edit_message_text("👎 Noted, thanks for feedback.")
+        await query.edit_message_text("👎 Noted.")
 
 telegram_app.add_handler(CommandHandler('start', start))
 telegram_app.add_handler(CommandHandler('track', track))
@@ -462,13 +427,11 @@ async def webhook():
     await telegram_app.process_update(update)
     return 'ok'
 
-# ---------- Startup ----------
 async def set_webhook():
     webhook_url = f"https://{os.environ.get('RENDER_EXTERNAL_HOSTNAME')}/webhook"
     await telegram_app.bot.set_webhook(webhook_url)
     logger.info(f"Webhook set to {webhook_url}")
 
-# Background scheduler
 scheduler = BackgroundScheduler()
 scheduler.add_job(lambda: asyncio.run(fetch_and_broadcast(telegram_app)), IntervalTrigger(hours=2))
 scheduler.add_job(lambda: asyncio.run(revalidate_deals(telegram_app)), IntervalTrigger(hours=4))
