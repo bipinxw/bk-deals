@@ -1,0 +1,9 @@
+python-telegram-bot==20.7
+google-generativeai==0.3.2
+chromadb==0.4.22
+apscheduler==3.10.4
+aiohttp==3.9.1
+beautifulsoup4==4.12.2
+lxml==4.9.3
+python-dotenv==1.0.0
+playwright==1.40.0
